@@ -6,3 +6,9 @@ documents/input/*
 documents/output/*
 !documents/input/.gitkeep
 !documents/output/.gitkeep
+
+# Workspace LLM configuration: carries llm.apiKey and mcp.accessKey.
+.wikirc*
+
+# Artefacts FUSE : fichier remplacé alors qu'un processus le tenait ouvert.
+.fuse_hidden*
