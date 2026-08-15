@@ -166,6 +166,28 @@ class DocumentMcpServerTest(unittest.TestCase):
         self.assertIn("write scope", self.payload(denied)["error"])
         self.assertIsNone(allowed)
 
+    def test_workspace_input_is_confined_to_staging_area(self):
+        (self.workspaces_root / "acpi").mkdir()
+        ws = self.server._validate_workspace("acpi")
+        staging = ws / "raw" / "untracked"
+        staging.mkdir(parents=True, exist_ok=True)
+        (ws / ".wikirc.yaml").write_text(
+            "llm:\n  apiKey: sk-SECRET\nmcp:\n  accessKey: fa483c\n", encoding="utf-8"
+        )
+        doc = staging / "note.txt"
+        doc.write_text("hello\n", encoding="utf-8")
+
+        # The workspace root (where .wikirc.yaml holds secrets) is not a valid
+        # input location, even though .yaml is a supported text extension.
+        with self.assertRaises(ValueError):
+            self.server._resolve_source({"filePath": ".wikirc.yaml"}, self.output_dir, ws)
+
+        # A file staged under raw/untracked stays resolvable.
+        resolved = self.server._resolve_source(
+            {"filePath": "raw/untracked/note.txt"}, self.output_dir, ws
+        )
+        self.assertEqual(str(resolved), str(doc.resolve()))
+
 
 if __name__ == "__main__":
     unittest.main()

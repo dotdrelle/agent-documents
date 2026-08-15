@@ -196,6 +196,22 @@ def _activity_for_job(job_id: str, job: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _parse_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off", ""}:
+            return False
+    raise ValueError(f"Expected a boolean, got: {value!r}")
+
+
 def _run_conversion_job(job_id: str, args: dict[str, Any]) -> None:
     def update(step_id: str, detail: str | None = None) -> None:
         with _jobs_lock:
@@ -210,7 +226,7 @@ def _run_conversion_job(job_id: str, args: dict[str, Any]) -> None:
         workspace_path = _validate_workspace(workspace) if workspace else None
         output_dir = (workspace_path / "raw" / "untracked") if workspace_path else _DOCUMENT_OUTPUT_DIR
         output_dir.mkdir(parents=True, exist_ok=True)
-        include_metadata = bool(args.get("includeMetadata", True))
+        include_metadata = _parse_bool(args.get("includeMetadata"), True)
         source = _resolve_source(args, tmpdir, workspace_path)
         with _jobs_lock:
             _conversion_jobs[job_id]["sourceName"] = source.name
@@ -579,7 +595,11 @@ def _resolve_source(args: dict[str, Any], tmpdir: Path, workspace_path: Path | N
             path = (_DOCUMENT_INPUT_DIR / raw_path).resolve()
         allowed_roots = [_DOCUMENT_INPUT_DIR]
         if workspace_path:
-            allowed_roots.insert(0, workspace_path)
+            # The workspace contributes only its ingestion staging area, never
+            # the workspace root: `.wikirc.yaml` (llm.apiKey / mcp.accessKey)
+            # and other secrets live at the root and are `.yaml`/`.md` text
+            # files this server would otherwise hand back via conversion status.
+            allowed_roots.insert(0, (workspace_path / "raw" / "untracked").resolve())
         _ensure_inside(path, allowed_roots)
         if not path.is_file():
             raise ValueError(f"Input file does not exist: {path}")
