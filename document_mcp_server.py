@@ -35,7 +35,7 @@ from starlette.types import Receive, Scope, Send
 import uvicorn
 
 
-app = Server("agent-wiki-documents")
+app = Server("agent-documents")
 
 _AGENT_VERSION = "0.15.66"
 _MCP_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
@@ -218,7 +218,7 @@ def _run_conversion_job(job_id: str, args: dict[str, Any]) -> None:
             _conversion_jobs[job_id]["stepId"] = step_id
             _conversion_jobs[job_id]["detail"] = detail
 
-    tmpdir_obj = tempfile.TemporaryDirectory(prefix="agent-wiki-documents-")
+    tmpdir_obj = tempfile.TemporaryDirectory(prefix="agent-documents-")
     tmpdir = Path(tmpdir_obj.name)
     try:
         update("resolve", "Resolving source file")
@@ -302,7 +302,7 @@ def _render_landing_page(endpoint_url: str, scheme: str) -> str:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>agent-wiki-documents MCP connector</title>
+  <title>agent-documents MCP connector</title>
   <style>
     :root {{ color-scheme: light dark; --bg:#f8fafc; --panel:#fff; --text:#111827; --muted:#64748b; --line:#d8dee8; --accent:#2563eb; --code:#eef2ff; }}
     @media (prefers-color-scheme: dark) {{ :root {{ --bg:#0f172a; --panel:#111827; --text:#f8fafc; --muted:#94a3b8; --line:#253044; --accent:#60a5fa; --code:#1e293b; }} }}
@@ -328,7 +328,7 @@ def _render_landing_page(endpoint_url: str, scheme: str) -> str:
 <body>
   <main>
     <div class="eyebrow">MCP Streamable HTTP</div>
-    <h1>agent-wiki-documents MCP connector</h1>
+    <h1>agent-documents MCP connector</h1>
     <p class="lead">Document ingestion agent for converting PDF, Office, text and image files into Markdown.</p>
     <section class="panel">
       <dl>
@@ -426,7 +426,7 @@ async def list_tools() -> list[Tool]:
     return [
         Tool(
             name="documents_status",
-            description="Check agent-wiki-documents configuration, directories and available conversion tools.",
+            description="Check agent-documents configuration, directories and available conversion tools.",
             inputSchema={"type": "object", "properties": {}, "additionalProperties": False},
         ),
         Tool(
@@ -513,7 +513,7 @@ def _tool_status() -> list[TextContent]:
     return _json_text(
         {
             "ok": True,
-            "service": "agent-wiki-documents",
+            "service": "agent-documents",
             "version": _AGENT_VERSION,
             "inputDir": str(_DOCUMENT_INPUT_DIR),
             "outputDir": str(_DOCUMENT_OUTPUT_DIR),
@@ -949,7 +949,7 @@ def _with_metadata(markdown: str, source: Path, method: str, ocr_status: str | N
         "source_file": source.name,
         "conversion_method": method,
         **({"ocr": ocr_status} if ocr_status else {}),
-        "service": "agent-wiki-documents",
+        "service": "agent-documents",
         "service_version": _AGENT_VERSION,
     }
     lines = ["---"]

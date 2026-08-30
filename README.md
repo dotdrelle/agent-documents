@@ -1,4 +1,4 @@
-# agent-wiki-documents
+# agent-documents
 
 Document ingestion MCP server for wiki workflows.
 

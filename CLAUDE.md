@@ -1,9 +1,9 @@
-# agent-wiki-documents
+# agent-documents
 
 Current coordinated release: **0.14.5**. Keep `_AGENT_VERSION` aligned with
 the coordinated workspace stack.
 
-`agent-wiki-documents` is an external MCP Streamable HTTP server for document
+`agent-documents` is an external MCP Streamable HTTP server for document
 ingestion. It converts PDFs, Office files, text files and images into Markdown
 for wiki ingestion workflows.
 
