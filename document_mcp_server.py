@@ -37,7 +37,7 @@ import uvicorn
 
 app = Server("agent-documents")
 
-_AGENT_VERSION = "0.15.66"
+_AGENT_VERSION = "0.15.70"
 _MCP_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
 _DOCUMENT_INPUT_DIR = Path(os.environ.get("DOCUMENT_INPUT_DIR", "/documents/input")).resolve()
 _DOCUMENT_OUTPUT_DIR = Path(os.environ.get("DOCUMENT_OUTPUT_DIR", "/documents/output")).resolve()

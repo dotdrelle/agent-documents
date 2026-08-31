@@ -1,6 +1,6 @@
 # agent-documents
 
-Current coordinated release: **0.14.5**. Keep `_AGENT_VERSION` aligned with
+Current coordinated release: **0.15.66**. Keep `_AGENT_VERSION` aligned with
 the coordinated workspace stack.
 
 `agent-documents` is an external MCP Streamable HTTP server for document

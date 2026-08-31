@@ -2,7 +2,7 @@
 
 Document ingestion MCP server for wiki workflows.
 
-Current coordinated release: **0.14.5**.
+Current coordinated release: **0.15.66**.
 
 It converts PDF, Office, text and image files to Markdown. OCR is used for
 images and for PDFs where direct text extraction returns no useful text.
