@@ -18,6 +18,8 @@ import urllib.error
 import urllib.request
 import uuid
 from collections.abc import AsyncIterator
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
@@ -37,7 +39,7 @@ import uvicorn
 
 app = Server("agent-documents")
 
-_AGENT_VERSION = "0.15.78"
+_AGENT_VERSION = "0.15.79"
 _MCP_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
 _DOCUMENT_INPUT_DIR = Path(os.environ.get("DOCUMENT_INPUT_DIR", "/documents/input")).resolve()
 _DOCUMENT_OUTPUT_DIR = Path(os.environ.get("DOCUMENT_OUTPUT_DIR", "/documents/output")).resolve()
@@ -47,6 +49,10 @@ _LLM_BASE_URL = os.environ.get("DOCUMENT_LLM_BASE_URL", os.environ.get("OPENAI_B
 _LLM_API_KEY = os.environ.get("DOCUMENT_LLM_API_KEY", os.environ.get("OPENAI_API_KEY", ""))
 _LLM_MODEL = os.environ.get("DOCUMENT_LLM_MODEL", "gpt-5.4-mini")
 _LLM_TIMEOUT_SECONDS = int(os.environ.get("DOCUMENT_LLM_TIMEOUT_SECONDS", "120"))
+_LLM_OCR_MAX_TOKENS = 8192
+_LLM_MAX_LINE_REPEATS = 10
+_POLISH_CHUNK_MAX_CHARS = 10000
+_POLISH_CHUNK_WORKERS = 3
 
 _conversion_jobs: dict[str, dict[str, Any]] = {}
 _jobs_lock = threading.Lock()
@@ -238,10 +244,14 @@ def _run_conversion_job(job_id: str, args: dict[str, Any]) -> None:
             _conversion_jobs[job_id]["method"] = method
             _conversion_jobs[job_id]["ocr"] = ocr_status
 
+        markdown, polish_status = _polish_converted_markdown(markdown, method, workspace_path)
+        with _jobs_lock:
+            _conversion_jobs[job_id]["polish"] = polish_status
+
         update("write", "Writing converted Markdown")
         output_name = _safe_output_name(args.get("outputFilename"), source)
         output_path = output_dir / output_name
-        final_markdown = _with_metadata(markdown, source, method, ocr_status) if include_metadata else markdown
+        final_markdown = _with_metadata(markdown, source, method, ocr_status, polish_status) if include_metadata else markdown
         output_path.write_text(final_markdown, encoding="utf-8")
         with _jobs_lock:
             _conversion_jobs[job_id].update({
@@ -545,6 +555,7 @@ def _tool_convert_to_markdown(args: dict[str, Any]) -> list[TextContent]:
             "sourceStr": None,
             "method": None,
             "ocr": None,
+            "polish": None,
             "outputPath": None,
             "bytes": None,
             "markdown": None,
@@ -570,6 +581,7 @@ def _tool_conversion_status(args: dict[str, Any]) -> list[TextContent]:
             "outputPath": job.get("outputPath"),
             "method": job.get("method"),
             "ocr": job.get("ocr"),
+            "polish": job.get("polish"),
             "bytes": job.get("bytes"),
             "markdown": job.get("markdown"),
         })
@@ -820,6 +832,397 @@ def _ocr_pdf(path: Path, tmpdir: Path, pages: list[int] | None = None) -> str:
     return "\n\n".join(chunks).strip() + "\n"
 
 
+_POLISH_EXEMPT_METHODS = {"text", "image-fallback", "pdf-fallback"}
+
+
+class _PolishSizeError(ValueError):
+    pass
+
+
+class _SimpleHtmlParser(HTMLParser):
+    _HEADING_PREFIX = {"h1": "# ", "h2": "## ", "h3": "### ", "h4": "#### ", "h5": "##### ", "h6": "###### "}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.out: list[str] = []
+        self._skip_depth = 0
+        self._table_rows: list[list[str]] = []
+        self._row_cells: list[str] = []
+        self._cell_active = False
+        self._cell: list[str] = []
+        self._list_ordered = False
+        self._href: str | None = None
+        self._href_text: list[str] = []
+
+    def _newline(self) -> None:
+        if not self.out or not self.out[-1].endswith("\n"):
+            self.out.append("\n")
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        attributes = {key: value for key, value in attrs}
+        if tag in {"style", "script"}:
+            self._skip_depth += 1
+            return
+        if self._skip_depth:
+            return
+        if tag in {"div", "p", "section", "tr"}:
+            self._newline()
+        elif tag in self._HEADING_PREFIX:
+            self._newline()
+            self.out.append(self._HEADING_PREFIX[tag])
+        elif tag == "br":
+            self.out.append("\n")
+        elif tag == "li":
+            self._newline()
+            self.out.append("1. " if self._list_ordered else "- ")
+        elif tag in {"ul", "ol"}:
+            self._list_ordered = tag == "ol"
+        elif tag == "table":
+            self._table_rows = []
+        elif tag in {"td", "th"}:
+            self._cell_active = True
+            self._cell = []
+        elif tag == "a":
+            self._href = attributes.get("href")
+            self._href_text = []
+        # b, strong, i, em, span, label, img: inline, nothing structural.
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if tag in {"style", "script"}:
+            self._skip_depth = max(0, self._skip_depth - 1)
+            return
+        if self._skip_depth:
+            return
+        if tag in {"div", "p", "section"}:
+            self._newline()
+        elif tag in self._HEADING_PREFIX:
+            self._newline()
+        elif tag == "br":
+            self.out.append("\n")
+        elif tag == "table":
+            self._emit_table()
+        elif tag in {"td", "th"}:
+            if self._cell_active:
+                self._row_cells.append("".join(self._cell).strip())
+                self._cell_active = False
+        elif tag == "tr":
+            if self._row_cells:
+                self._table_rows.append(self._row_cells)
+                self._row_cells = []
+        elif tag in {"ul", "ol"}:
+            self._newline()
+        elif tag == "a":
+            link = ""
+            if self._href and self._href_text:
+                text = "".join(self._href_text).strip()
+                link = f"[{text}]({self._href})" if text else self._href
+            elif self._href:
+                link = self._href
+            if link:
+                if self._cell_active:
+                    self._cell.append(link)
+                else:
+                    self.out.append(link)
+            self._href = None
+
+    def handle_data(self, data: str) -> None:
+        if self._skip_depth:
+            return
+        if self._cell_active:
+            self._cell.append(data)
+            return
+        if self._href is not None:
+            self._href_text.append(data)
+            return
+        self.out.append(data)
+
+    def _emit_table(self) -> None:
+        rows = [row for row in self._table_rows if any(cell.strip() for cell in row)]
+        if not rows:
+            self._table_rows = []
+            return
+        width = max(len(row) for row in rows)
+        rows = [row + [""] * (width - len(row)) for row in rows]
+        rows = [[cell.replace("\n", " ").replace("|", "\\|").strip() for cell in row] for row in rows]
+        self.out.append("| " + " | ".join(rows[0]) + " |")
+        self.out.append("| " + " | ".join(["---"] * width) + " |")
+        for row in rows[1:]:
+            self.out.append("| " + " | ".join(row) + " |")
+        self._table_rows = []
+        self._newline()
+
+    def result(self) -> str:
+        text = "".join(self.out).replace("\xa0", " ")
+        lines = [line.rstrip() for line in text.splitlines()]
+        return "\n".join(lines)
+
+
+def _html_to_markdown(html_text: str) -> str:
+    parser = _SimpleHtmlParser()
+    parser.feed(html_text)
+    parser.close()
+    return parser.result()
+
+
+def _cleanup_markdown(markdown: str) -> str:
+    segments = re.split(r"(```.*?```)", markdown, flags=re.DOTALL)
+    cleaned: list[str] = []
+    for segment in segments:
+        if segment.startswith("```") and segment.endswith("```"):
+            cleaned.append(segment)
+        elif re.search(r"<[a-zA-Z!/][^>]*>", segment):
+            cleaned.append(_html_to_markdown(segment))
+        else:
+            cleaned.append(segment)
+    text = "".join(cleaned)
+    text = re.sub(r"!\[[^\]]*\]\((?!https?://)[^)]*\)\s*", "", text)
+    text = re.sub(r"\[([^\]]+)\]\(\s*(https?://[^\s)]*)\s*\n\s*([^)\s]*)", r"[\1](\2\3)", text)
+    text = re.sub(r"\[([^\]]+)\]\(\s*(/[^\s)]*)\s*\n\s*([^)\s]*)", r"[\1](\2\3)", text)
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"^[ \t]+(#{1,6}\s)", r"\1", text, flags=re.MULTILINE)
+    return _normalize_mermaid_blocks(text)
+
+
+def _polish_converted_markdown(markdown: str, method: str, workspace_path: Path | None) -> tuple[str, str | None]:
+    if method in _POLISH_EXEMPT_METHODS:
+        return markdown, None
+    markdown = _cleanup_markdown(markdown)
+    return _polish_markdown(markdown, _workspace_language(workspace_path), workspace_path)
+
+
+def _polish_markdown(markdown: str, language: str | None = None, workspace_path: Path | None = None) -> tuple[str, str | None]:
+    if not markdown.strip():
+        return markdown, None
+    llm_config = _polish_llm_config(workspace_path)
+    if not llm_config:
+        return markdown, None
+    base_url, model, api_key = llm_config
+    try:
+        return _llm_polish_call(markdown, language=language, base_url=base_url, model=model, api_key=api_key), "done"
+    except _PolishSizeError as exc:
+        chunks = _split_markdown_chunks(markdown)
+        if len(chunks) > 1:
+            return _polish_chunks(chunks, language, base_url, model, api_key)
+        return markdown, _ocr_skipped_reason(exc)
+    except Exception as exc:
+        return markdown, _ocr_skipped_reason(exc)
+
+
+def _polish_chunks(chunks: list[str], language: str | None, base_url: str, model: str, api_key: str) -> tuple[str, str | None]:
+    with ThreadPoolExecutor(max_workers=_POLISH_CHUNK_WORKERS) as pool:
+        futures = {pool.submit(_polish_one_chunk, chunk, language, base_url, model, api_key): index for index, chunk in enumerate(chunks)}
+        results: list[tuple[str, str | None]] = [("", None)] * len(chunks)
+        for future in as_completed(futures):
+            results[futures[future]] = future.result()
+    polished_chunks = [item[0] for item in results]
+    failures = [item[1] for item in results if item[1] is not None]
+    polished = "\n\n".join(polished_chunks).strip() + "\n"
+    if not failures:
+        return polished, "done"
+    if len(failures) == len(chunks):
+        return "\n\n".join(chunks).strip() + "\n", _ocr_skipped_reason(
+            ValueError(f"{len(failures)} chunk(s) failed: {failures[0]}")
+        )
+    return polished, f"partial ({len(failures)}/{len(chunks)} chunk(s) skipped: {failures[0]})"
+
+
+def _polish_one_chunk(chunk: str, language: str | None, base_url: str, model: str, api_key: str) -> tuple[str, str | None]:
+    try:
+        return _llm_polish_call(chunk, language=language, base_url=base_url, model=model, api_key=api_key), None
+    except Exception as exc:
+        return chunk, _mask_secret_text(exc)
+
+
+def _split_markdown_chunks(markdown: str) -> list[str]:
+    blocks: list[str] = []
+    current: list[str] = []
+    for line in markdown.splitlines():
+        if re.match(r"^#{1,6}\s", line) and current:
+            blocks.append("\n".join(current))
+            current = [line]
+        else:
+            current.append(line)
+    if current:
+        blocks.append("\n".join(current))
+
+    chunks: list[str] = []
+    pending = ""
+    for block in blocks:
+        if len(block) > _POLISH_CHUNK_MAX_CHARS:
+            if pending.strip():
+                chunks.append(pending)
+                pending = ""
+            chunks.extend(_split_block_into_chunks(block))
+            continue
+        candidate = f"{pending}\n\n{block}" if pending.strip() else block
+        if len(candidate) <= _POLISH_CHUNK_MAX_CHARS:
+            pending = candidate
+        else:
+            chunks.append(pending)
+            pending = block
+    if pending.strip():
+        chunks.append(pending)
+    return chunks
+
+
+def _split_block_into_chunks(block: str) -> list[str]:
+    paragraphs = [part for part in re.split(r"\n\s*\n", block) if part.strip()]
+    chunks: list[str] = []
+    pending = ""
+    for paragraph in paragraphs:
+        if not pending.strip():
+            pending = paragraph
+            continue
+        candidate = f"{pending}\n\n{paragraph}"
+        if len(candidate) <= _POLISH_CHUNK_MAX_CHARS:
+            pending = candidate
+        else:
+            chunks.append(pending)
+            pending = paragraph
+    if pending.strip():
+        chunks.append(pending)
+    return chunks
+
+
+def _llm_polish_call(markdown: str, language: str | None = None, base_url: str | None = None, model: str | None = None, api_key: str | None = None) -> str:
+    base_url = (base_url or _LLM_BASE_URL).rstrip("/")
+    model = model or _LLM_MODEL
+    api_key = api_key or _LLM_API_KEY
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": _polish_prompt(language) + "\n\n---\n\n" + markdown}],
+            }
+        ],
+    }
+    if not _model_refuses_temperature(model):
+        payload["temperature"] = 0
+    data = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        f"{base_url}/chat/completions",
+        data=data,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=_LLM_TIMEOUT_SECONDS) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        if exc.code == 400:
+            raise _PolishSizeError(f"Markdown polish failed: HTTP {exc.code}: {body}") from exc
+        raise ValueError(f"Markdown polish failed: HTTP {exc.code}: {body}") from exc
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
+        raise ValueError(f"Markdown polish failed: {exc}") from exc
+
+    choice = result.get("choices", [{}])[0]
+    if choice.get("finish_reason") == "length":
+        raise _PolishSizeError("Markdown polish output was truncated (model ran out of output budget).")
+    content = choice.get("message", {}).get("content", "")
+    cleaned = _clean_llm_markdown(str(content))
+    if not cleaned:
+        raise ValueError("Markdown polish returned empty Markdown.")
+    if _looks_degenerate(cleaned):
+        raise ValueError("Markdown polish returned repetitive/degenerate content.")
+    return cleaned
+
+
+def _polish_prompt(language: str | None = None) -> str:
+    language_line = (
+        f" The document is written in {language}; keep that language and do not translate it."
+        if language
+        else ""
+    )
+    return (
+        "The Markdown below was produced by an automated conversion (OCR or a document-to-Markdown "
+        "transformation). Clean it up into one well-formed Markdown document: repair broken Markdown "
+        "syntax; fix links and references that the conversion split across lines or corrupted (rejoin "
+        "a label with its URL when the break is clearly one link); convert any leftover HTML fragments "
+        "into equivalent Markdown (keep the visible text and structure — boxes become lists, HTML "
+        "tables become Markdown tables — drop styling attributes, and remove image references whose "
+        "files are not part of the document); drop OCR or encoding errors and stray artifacts; remove "
+        "headers duplicated by the conversion; harmonize heading levels; and reflow tables or lists "
+        "split across a page break."
+        + language_line
+        + " Do not remove, summarize, translate, or invent any content: preserve every fact, label, "
+        "and table cell exactly. Return only the cleaned Markdown, with no commentary outside it."
+    )
+
+
+def _model_refuses_temperature(model: str) -> bool:
+    bare = model.rsplit("/", 1)[-1]
+    return re.match(r"^gpt-5(?:[.-]|$)", bare, re.IGNORECASE) is not None
+
+
+def _workspace_language(workspace_path: Path | None) -> str | None:
+    if not workspace_path:
+        return None
+    config_path = workspace_path / ".wikirc.yaml"
+    if not config_path.is_file():
+        return None
+    try:
+        text = config_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        match = re.match(r"^language:\s*(.+?)\s*(?:#.*)?$", line)
+        if match:
+            value = match.group(1).strip().strip("'\"")
+            return value or None
+    return None
+
+
+def _wikirc_llm_block(workspace_path: Path | None) -> dict[str, str] | None:
+    if not workspace_path:
+        return None
+    config_path = workspace_path / ".wikirc.yaml"
+    if not config_path.is_file():
+        return None
+    try:
+        text = config_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    block: dict[str, str] = {}
+    in_llm = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip())
+        if indent == 0:
+            if stripped.startswith("llm:"):
+                in_llm = True
+            elif in_llm:
+                break
+        elif in_llm:
+            match = re.match(r"^([A-Za-z][A-Za-z0-9]*):\s*(.+?)\s*(?:#.*)?$", stripped)
+            if match:
+                block[match.group(1)] = match.group(2).strip().strip("'\"").strip()
+    if not block.get("model") or not block.get("baseUrl"):
+        return None
+    return block
+
+
+def _polish_llm_config(workspace_path: Path | None) -> tuple[str, str, str] | None:
+    block = _wikirc_llm_block(workspace_path)
+    if block:
+        base_url = block["baseUrl"]
+        api_key = block.get("apiKey") or _LLM_API_KEY
+        if api_key:
+            return base_url, block["model"], api_key
+    if _LLM_API_KEY and _LLM_MODEL:
+        return _LLM_BASE_URL, _LLM_MODEL, _LLM_API_KEY
+    return None
+
+
 def _ocr_image(path: Path, tmpdir: Path | None = None) -> str:
     _require_llm_ocr()
     return _llm_image_to_markdown(path).strip() + "\n"
@@ -838,7 +1241,7 @@ def _llm_image_to_markdown(path: Path) -> str:
     if not mime or not mime.startswith("image/"):
         mime = "image/png"
     image_b64 = base64.b64encode(path.read_bytes()).decode("ascii")
-    payload = {
+    payload: dict[str, Any] = {
         "model": _LLM_MODEL,
         "messages": [
             {
@@ -849,8 +1252,10 @@ def _llm_image_to_markdown(path: Path) -> str:
                 ],
             }
         ],
-        "temperature": 0,
+        "max_tokens": _LLM_OCR_MAX_TOKENS,
     }
+    if not _model_refuses_temperature(_LLM_MODEL):
+        payload["temperature"] = 0
     data = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
         f"{_LLM_BASE_URL}/chat/completions",
@@ -864,6 +1269,9 @@ def _llm_image_to_markdown(path: Path) -> str:
     try:
         with urllib.request.urlopen(request, timeout=_LLM_TIMEOUT_SECONDS) as response:
             result = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise ValueError(f"LLM OCR failed: HTTP {exc.code}: {body}") from exc
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
         raise ValueError(f"LLM OCR failed: {exc}") from exc
 
@@ -875,6 +1283,8 @@ def _llm_image_to_markdown(path: Path) -> str:
     markdown = _clean_llm_markdown(str(content))
     if not markdown:
         raise ValueError("LLM OCR returned empty Markdown.")
+    if _looks_degenerate(markdown):
+        raise ValueError("LLM OCR returned repetitive/degenerate content.")
     return markdown
 
 
@@ -882,12 +1292,28 @@ def _llm_ocr_prompt() -> str:
     return (
         "Convert this image faithfully to Markdown. "
         "Return only Markdown, with no commentary outside the converted content. "
+        "Never emit HTML tags: output pure Markdown only. "
         "Preserve the visible labels, titles, lists, tables, relationships, and their original language. "
         "If the image contains a diagram, add a '## Mermaid Diagram' section with a ```mermaid block. "
         "The Mermaid diagram must reconstruct visible groups/subgraphs, actors, systems, databases, arrows, labels, and protocols. "
         "Use simple ASCII Mermaid IDs, quoted labels, no escaped quotes, and <br/> line breaks inside labels. "
         "Do not invent missing elements. If an area is unreadable, keep the best readable label."
     )
+
+
+def _looks_degenerate(markdown: str) -> bool:
+    counts: dict[str, int] = {}
+    total = 0
+    for line in markdown.splitlines():
+        stripped = line.strip().lstrip("#").strip()
+        if not stripped:
+            continue
+        total += 1
+        counts[stripped] = counts.get(stripped, 0) + 1
+    for count in counts.values():
+        if count > _LLM_MAX_LINE_REPEATS and count * 2 > total:
+            return True
+    return False
 
 
 def _clean_llm_markdown(value: str) -> str:
@@ -942,13 +1368,14 @@ def _plain_text_to_markdown(text: str) -> str:
     return "\n\n".join(blocks).strip() + "\n"
 
 
-def _with_metadata(markdown: str, source: Path, method: str, ocr_status: str | None = None) -> str:
+def _with_metadata(markdown: str, source: Path, method: str, ocr_status: str | None = None, polish_status: str | None = None) -> str:
     title = source.stem.replace("_", " ").replace("-", " ").strip() or source.name
     front_matter = {
         "title": title,
         "source_file": source.name,
         "conversion_method": method,
         **({"ocr": ocr_status} if ocr_status else {}),
+        **({"polish": polish_status} if polish_status else {}),
         "service": "agent-documents",
         "service_version": _AGENT_VERSION,
     }
