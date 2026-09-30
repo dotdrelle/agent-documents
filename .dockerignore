@@ -6,3 +6,5 @@ documents/input/*
 documents/output/*
 !documents/input/.gitkeep
 !documents/output/.gitkeep
+.env.*
+.git/
