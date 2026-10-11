@@ -1,6 +1,6 @@
 # agent-documents
 
-Current coordinated release: **0.15.66**. Keep `_AGENT_VERSION` aligned with
+Current coordinated release: **0.16.55** (trust `_AGENT_VERSION` and the git tag, not this line). Keep `_AGENT_VERSION` aligned with
 the coordinated workspace stack.
 
 `agent-documents` is an external MCP Streamable HTTP server for document
@@ -160,7 +160,7 @@ before that lot lands.
 
 Keep `_AGENT_VERSION` aligned with the coordinated `llm-wiki-manager` release
 version so status responses identify the deployed agent bundle. Current release
-line: `0.12.0`. Alignment is checked by `llm-wiki-manager/scripts/check-versions.js`
+line: `0.16.55`. Alignment is checked by `llm-wiki-manager/scripts/check-versions.js`
 and synced by the root `build-and-push.sh`.
 
 MCP tool descriptions, `_activity` metadata, conversion progress labels,
