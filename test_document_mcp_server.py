@@ -157,7 +157,7 @@ class DocumentMcpServerTest(unittest.TestCase):
     def test_looks_degenerate_tolerates_legitimate_repeated_footers(self):
         # A footer table legitimately repeats on every page (17 times here) —
         # that is not the runaway repetition the guard exists to catch.
-        footer_lines = ["Titre : ACPI III – Cahier des charges", "Référence :", "Date d'application : 30/07/2026"]
+        footer_lines = ["Titre : ATLAS III – Cahier des charges", "Référence :", "Date d'application : 30/07/2026"]
         lines = footer_lines * 17 + [f"paragraphe {i}" for i in range(600)]
         self.assertFalse(self.server._looks_degenerate("\n\n".join(lines)))
 
@@ -357,7 +357,7 @@ class DocumentMcpServerTest(unittest.TestCase):
         self.assertFalse(self.server._model_refuses_temperature("mistral-small-3-2-24b-instruct-2506"))
 
     def test_wikirc_llm_block_reads_llm_section_only(self):
-        ws = self.workspaces_root / "acpi"
+        ws = self.workspaces_root / "atlas"
         ws.mkdir()
         (ws / ".wikirc.yaml").write_text(
             "language: fr\n"
@@ -385,7 +385,7 @@ class DocumentMcpServerTest(unittest.TestCase):
         self.assertIsNone(self.server._wikirc_llm_block(None))
 
     def test_polish_uses_workspace_wikirc_llm(self):
-        ws = self.workspaces_root / "acpi"
+        ws = self.workspaces_root / "atlas"
         ws.mkdir()
         (ws / ".wikirc.yaml").write_text(
             "llm:\n"
@@ -427,7 +427,7 @@ class DocumentMcpServerTest(unittest.TestCase):
         self.assertIsNone(self.server._workspace_language(None))
         self.assertIsNone(self.server._workspace_language(self.workspaces_root))
 
-        ws = self.workspaces_root / "acpi"
+        ws = self.workspaces_root / "atlas"
         ws.mkdir()
         (ws / ".wikirc.yaml").write_text("language: fr\nllm:\n  apiKey: sk-SECRET\n", encoding="utf-8")
         self.assertEqual(self.server._workspace_language(ws), "fr")
@@ -625,8 +625,8 @@ class DocumentMcpServerTest(unittest.TestCase):
         self.assertIsNone(allowed)
 
     def test_workspace_input_is_confined_to_staging_area(self):
-        (self.workspaces_root / "acpi").mkdir()
-        ws = self.server._validate_workspace("acpi")
+        (self.workspaces_root / "atlas").mkdir()
+        ws = self.server._validate_workspace("atlas")
         staging = ws / "raw" / "untracked"
         staging.mkdir(parents=True, exist_ok=True)
         (ws / ".wikirc.yaml").write_text(
