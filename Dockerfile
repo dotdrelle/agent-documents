@@ -1,10 +1,8 @@
-FROM python:3.14-slim
+FROM python:3.13-slim
 
 WORKDIR /app
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-      poppler-utils && \
     apt-get upgrade -y && \
     rm -rf /var/lib/apt/lists/*
 
@@ -12,8 +10,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir \
     "mcp>=1.9.4,<2" \
     "markitdown[pdf,docx,pptx,xlsx,xls]" \
-    markitdown-ocr \
-    openai \
+    "indra-ocr==1.1.2" \
     PyMuPDF \
     starlette \
     uvicorn
@@ -31,16 +28,16 @@ ENV MCP_PORT=8080
 ENV DOCUMENT_INPUT_DIR=/documents/input
 ENV DOCUMENT_OUTPUT_DIR=/documents/output
 ENV DOCUMENT_MAX_UPLOAD_BYTES=52428800
-ENV DOCUMENT_LLM_BASE_URL=https://api.openai.com/v1
-ENV DOCUMENT_LLM_MODEL=gpt-5.4-mini
-ENV DOCUMENT_LLM_TIMEOUT_SECONDS=120
+ENV HF_HOME=/var/cache/huggingface
+ENV INDRA_OCR_THREADS=4
 
 # Unprivileged runtime user. Its home does not exist on purpose: an arbitrary
 # Compose `user:` has no writable home either, so both paths behave the same.
 RUN groupadd --system --gid 1000 app && \
     useradd --system --uid 1000 --gid app --no-create-home \
       --home-dir /nonexistent --shell /usr/sbin/nologin app && \
-    install -d -o app -g app /documents/input /documents/output
+    install -d -o app -g app /documents/input /documents/output && \
+    install -d -m 1777 /var/cache/huggingface
 
 EXPOSE 8080
 

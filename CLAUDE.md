@@ -11,7 +11,7 @@ for wiki ingestion workflows.
 
 - `document_mcp_server.py`: Starlette/uvicorn MCP server with bearer-auth
   middleware and conversion tools.
-- `Dockerfile`: runtime image with MarkItDown, Poppler and LLM OCR support.
+- `Dockerfile`: runtime image with MarkItDown and local Indra OCR.
 - `docker-compose.yml`: standalone local service on port `3337` by default.
 - `documents/input`: mounted input directory for local files.
 - `WORKSPACES_ROOT`: container root for all workspaces. When a conversion call
@@ -26,15 +26,17 @@ for wiki ingestion workflows.
 - `documents_convert_to_markdown`: converts one file to Markdown from either a
   mounted `filePath` or `base64Content` plus `filename`.
 
-OCR degradation (0.12.0 corrective release): LLM-OCR/embedding failures must
-not fail the conversion. On such errors the server falls back to plain
-conversion (MarkItDown/PDF extraction without OCR) and flags the result with
-the skip reason (`_ocr_skipped_reason`). Keep this behavior when touching the
-conversion paths.
+OCR degradation: Indra model download, initialization or page-conversion
+failures must not fail the conversion. Images return a clearly marked fallback
+stub; PDFs preserve extractable text when possible and mark OCR as skipped with
+the reason (`_ocr_skipped_reason`). Keep this behavior when touching the
+conversion paths. OCR itself must remain local and must not call an LLM or the
+MarkItDown OCR plugin.
 
 Markdown polish: every conversion whose Markdown was produced by a machine
-transformation (full or partial LLM-OCR of a PDF, MarkItDown output of a PDF
-or an Office file, OCR of an image) gets two finishing steps
+transformation (Indra output for a PDF or image, MarkItDown output of an Office
+file, and Indra OCR of raster images embedded in ZIP-based Office files) gets
+two finishing steps
 (`_polish_converted_markdown`, called from `_run_conversion_job` after
 `_convert_file` and **before the file is written**). First a deterministic,
 LLM-free cleanup (`_cleanup_markdown`): leftover HTML is converted to
@@ -68,16 +70,12 @@ The polish call reuses the workspace's own LLM: `_polish_llm_config` reads the
 (`_wikirc_llm_block`; only that block is read, nothing else from the file is
 touched or logged, and the key only ever goes into the Authorization header).
 That is the model the workspace already uses for everything else — no second
-model to configure. When there is no workspace or no usable `llm` block, it
-falls back to the agent's own `DOCUMENT_LLM_*` configuration. This replaced an
-earlier `DOCUMENT_POLISH_LLM_MODEL` env var, which duplicated a whole model
-configuration that already lived in `.wikirc.yaml`.
+model to configure. When there is no workspace or no complete `llm` block
+(including its API key), polish is skipped. The agent has no separate LLM
+environment configuration.
 
-Degenerate-output guard: both the per-page OCR call and the polish call run at
-`temperature=0` (greedy decoding) with no repetition penalty, which can lock a
-vision model into repeating the same short line (e.g. a page-number footer
-like "12/18") hundreds of times instead of stopping — observed in practice on
-a page the model otherwise failed to read. `_looks_degenerate` counts
+Degenerate-output guard: the polish call runs at `temperature=0` (greedy
+decoding) with no repetition penalty. `_looks_degenerate` counts
 non-empty lines (heading markers stripped, so "# 12/18" and "## 12/18" count
 as the same line) and flags the output only when a line repeats more than
 `_LLM_MAX_LINE_REPEATS` (10) times **and** those repeats make up more than
@@ -86,12 +84,11 @@ footer table on every page ("Titre / Référence / Date", 17 times in an
 18-page PDF) and the first version of the guard treated that as runaway
 repetition and discarded a perfectly polished document. A failure raises
 instead of returning the runaway content — it then flows through the same
-skip-reason fallback as any other OCR/polish failure. `_LLM_OCR_MAX_TOKENS`
-(8192) bounds one page's OCR call.
+skip-reason fallback as any other polish failure.
 The one exception to `temperature=0`: gpt-5-class models refuse the
 `temperature` parameter outright (same documented refusal as llm-wiki's
-`engineCapabilities`), so `_model_refuses_temperature` omits it from both
-payloads when the bare model name matches `gpt-5` — without this, every call
+`engineCapabilities`), so `_model_refuses_temperature` omits it from the
+polish payload when the bare model name matches `gpt-5` — without this, every call
 against the default `gpt-5.4-mini` would fail with a 400 and silently degrade
 to the unpolished output.
 
@@ -164,6 +161,6 @@ line: `0.16.65`. Alignment is checked by `llm-wiki-manager/scripts/check-version
 and synced by the root `build-and-push.sh`.
 
 MCP tool descriptions, `_activity` metadata, conversion progress labels,
-status/correction pages, and operator-facing errors must stay in English. OCR
-and image-to-Markdown prompts may instruct the LLM to preserve the original
-document language, but the service UI itself is not localized from `.wikirc`.
+status/correction pages, and operator-facing errors must stay in English. Indra
+OCR preserves the recognized document language; the optional polish prompt also
+keeps the language from `.wikirc`.

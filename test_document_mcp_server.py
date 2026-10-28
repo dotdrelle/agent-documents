@@ -99,6 +99,9 @@ class DocumentMcpServerTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def enable_workspace_llm(self, model="some-model", base_url="https://test.example/v1", api_key="sk-test"):
+        self.server._polish_llm_config = lambda _workspace_path: (base_url, model, api_key)
+
     def payload(self, result):
         return json.loads(result[0].text)
 
@@ -123,8 +126,7 @@ class DocumentMcpServerTest(unittest.TestCase):
         self.assertNotIn("polish", status["markdown"])
         self.assertTrue(Path(status["outputPath"]).is_file())
 
-    def test_image_conversion_continues_when_llm_ocr_is_unavailable(self):
-        self.server._LLM_API_KEY = ""
+    def test_image_conversion_continues_when_indra_is_unavailable(self):
         source = self.input_dir / "scan.png"
         source.write_bytes(b"not really an image but enough for fallback test")
 
@@ -165,8 +167,7 @@ class DocumentMcpServerTest(unittest.TestCase):
         self.assertTrue(self.server._looks_degenerate("\n\n".join(["12/18"] * 100 + ["unique"])))
 
     def test_polish_markdown_falls_back_on_degenerate_output(self):
-        self.server._LLM_API_KEY = "sk-test"
-        self.server._LLM_MODEL = "mistral-small-3-2-24b-instruct-2506"
+        self.enable_workspace_llm(model="mistral-small-3-2-24b-instruct-2506")
 
         class FakeResponse:
             def __enter__(self_inner):
@@ -191,8 +192,7 @@ class DocumentMcpServerTest(unittest.TestCase):
         self.assertIn("degenerate", reason)
 
     def test_polish_markdown_does_not_send_max_tokens(self):
-        self.server._LLM_API_KEY = "sk-test"
-        self.server._LLM_MODEL = "some-model"
+        self.enable_workspace_llm()
 
         class FakeResponse:
             def __enter__(self_inner):
@@ -223,8 +223,7 @@ class DocumentMcpServerTest(unittest.TestCase):
         self.assertNotIn("max_tokens", captured["payload"])
 
     def test_polish_markdown_falls_back_on_context_length_error(self):
-        self.server._LLM_API_KEY = "sk-test"
-        self.server._LLM_MODEL = "some-small-context-model"
+        self.enable_workspace_llm(model="some-small-context-model")
 
         def fake_urlopen(request, timeout=None):
             body = json.dumps({
@@ -247,8 +246,7 @@ class DocumentMcpServerTest(unittest.TestCase):
         self.assertIn("skipped", reason)
 
     def test_polish_markdown_falls_back_when_output_is_truncated(self):
-        self.server._LLM_API_KEY = "sk-test"
-        self.server._LLM_MODEL = "some-small-context-model"
+        self.enable_workspace_llm(model="some-small-context-model")
 
         class FakeResponse:
             def __enter__(self_inner):
@@ -272,14 +270,13 @@ class DocumentMcpServerTest(unittest.TestCase):
         self.assertIn("truncated", reason)
 
     def test_polish_markdown_skipped_without_llm_configured(self):
-        self.server._LLM_API_KEY = ""
+        self.server._polish_llm_config = lambda _workspace_path: None
         polished, reason = self.server._polish_markdown("# raw\n\ntext")
         self.assertEqual(polished, "# raw\n\ntext")
         self.assertIsNone(reason)
 
     def test_polish_markdown_falls_back_when_llm_call_fails(self):
-        self.server._LLM_API_KEY = "sk-test"
-        self.server._LLM_MODEL = "mistral-small-3-2-24b-instruct-2506"
+        self.enable_workspace_llm(model="mistral-small-3-2-24b-instruct-2506")
 
         def failing_call(_markdown, **kwargs):
             raise ValueError("boom")
@@ -295,8 +292,7 @@ class DocumentMcpServerTest(unittest.TestCase):
         self.assertIn("skipped", reason)
 
     def test_polish_markdown_returns_cleaned_content_on_success(self):
-        self.server._LLM_API_KEY = "sk-test"
-        self.server._LLM_MODEL = "mistral-small-3-2-24b-instruct-2506"
+        self.enable_workspace_llm(model="mistral-small-3-2-24b-instruct-2506")
 
         original = self.server._llm_polish_call
         self.server._llm_polish_call = lambda _markdown, **kwargs: "# cleaned\n\ntext"
@@ -309,8 +305,7 @@ class DocumentMcpServerTest(unittest.TestCase):
         self.assertEqual(reason, "done")
 
     def test_gpt5_models_omit_temperature_from_llm_payloads(self):
-        self.server._LLM_API_KEY = "sk-test"
-        self.server._LLM_MODEL = "gpt-5.4-mini"
+        self.enable_workspace_llm(model="gpt-5.4-mini")
 
         captured = {}
 
@@ -339,7 +334,7 @@ class DocumentMcpServerTest(unittest.TestCase):
         self.assertEqual(reason, "done")
         self.assertNotIn("temperature", captured["payload"])
 
-        self.server._LLM_MODEL = "mistral-small-3-2-24b-instruct-2506"
+        self.enable_workspace_llm(model="mistral-small-3-2-24b-instruct-2506")
         captured.clear()
         original_urlopen = self.server.urllib.request.urlopen
         self.server.urllib.request.urlopen = fake_urlopen
@@ -413,14 +408,7 @@ class DocumentMcpServerTest(unittest.TestCase):
         self.assertEqual(captured["base_url"], "https://albert.api.etalab.gouv.fr/v1")
         self.assertEqual(captured["api_key"], "sk-WIKIRC")
 
-    def test_polish_falls_back_to_documents_llm_without_workspace(self):
-        self.server._LLM_API_KEY = "sk-test"
-        self.server._LLM_MODEL = "some-model"
-        self.assertEqual(
-            self.server._polish_llm_config(None),
-            (self.server._LLM_BASE_URL, "some-model", "sk-test"),
-        )
-        self.server._LLM_API_KEY = ""
+    def test_polish_requires_workspace_llm_without_environment_fallback(self):
         self.assertIsNone(self.server._polish_llm_config(None))
 
     def test_workspace_language_reads_top_level_wikirc_key(self):
@@ -445,8 +433,7 @@ class DocumentMcpServerTest(unittest.TestCase):
         self.assertNotIn("do not translate", no_language)
 
     def test_polished_conversion_skips_text_and_fallbacks(self):
-        self.server._LLM_API_KEY = "sk-test"
-        self.server._LLM_MODEL = "some-model"
+        self.enable_workspace_llm()
 
         def failing_call(_markdown, **kwargs):
             raise ValueError("boom")
@@ -475,7 +462,7 @@ class DocumentMcpServerTest(unittest.TestCase):
     def test_with_metadata_includes_polish_status(self):
         source = self.input_dir / "note.pdf"
         source.write_bytes(b"%PDF")
-        text = self.server._with_metadata("body", source, "pdf-llm-ocr", "done", "skipped (boom)")
+        text = self.server._with_metadata("body", source, "pdf-indra-ocr", "done", "skipped (boom)")
         self.assertIn('polish: "skipped (boom)"', text)
         self.assertIn('ocr: "done"', text)
 
@@ -495,8 +482,7 @@ class DocumentMcpServerTest(unittest.TestCase):
         self.assertEqual(len(chunks), 1)
 
     def test_polish_markdown_retries_chunked_when_output_truncates(self):
-        self.server._LLM_API_KEY = "sk-test"
-        self.server._LLM_MODEL = "some-model"
+        self.enable_workspace_llm()
         sections = [f"## Section {i}\n\n" + ("paragraph content " * 200) for i in range(8)]
         markdown = "\n\n".join(sections)
 
@@ -520,9 +506,6 @@ class DocumentMcpServerTest(unittest.TestCase):
         self.assertIn("cleaned:", polished)
 
     def test_polish_chunks_partial_failure_keeps_original_chunk(self):
-        self.server._LLM_API_KEY = "sk-test"
-        self.server._LLM_MODEL = "some-model"
-
         original = self.server._llm_polish_call
 
         def flaky(content, **kwargs):
@@ -543,9 +526,6 @@ class DocumentMcpServerTest(unittest.TestCase):
         self.assertIn("partial (1/2", reason)
 
     def test_polish_chunks_all_failures_return_original_with_skipped(self):
-        self.server._LLM_API_KEY = "sk-test"
-        self.server._LLM_MODEL = "some-model"
-
         original = self.server._llm_polish_call
 
         def failing(content, **kwargs):

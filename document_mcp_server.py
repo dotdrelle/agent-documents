@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Document ingestion MCP Server - convert files to Markdown with OCR fallback."""
+"""Document ingestion MCP Server - convert files to Markdown with local OCR."""
 
 import base64
 import contextvars
@@ -10,13 +10,13 @@ import mimetypes
 import os
 import re
 import shutil
-import subprocess
 import tempfile
 import threading
 import time
 import urllib.error
 import urllib.request
 import uuid
+import zipfile
 from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from html.parser import HTMLParser
@@ -45,14 +45,20 @@ _DOCUMENT_INPUT_DIR = Path(os.environ.get("DOCUMENT_INPUT_DIR", "/documents/inpu
 _DOCUMENT_OUTPUT_DIR = Path(os.environ.get("DOCUMENT_OUTPUT_DIR", "/documents/output")).resolve()
 _WORKSPACES_ROOT = Path(os.environ.get("WORKSPACES_ROOT", "/workspaces")).resolve()
 _MAX_UPLOAD_BYTES = int(os.environ.get("DOCUMENT_MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))
-_LLM_BASE_URL = os.environ.get("DOCUMENT_LLM_BASE_URL", os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")).rstrip("/")
-_LLM_API_KEY = os.environ.get("DOCUMENT_LLM_API_KEY", os.environ.get("OPENAI_API_KEY", ""))
-_LLM_MODEL = os.environ.get("DOCUMENT_LLM_MODEL", "gpt-5.4-mini")
-_LLM_TIMEOUT_SECONDS = int(os.environ.get("DOCUMENT_LLM_TIMEOUT_SECONDS", "120"))
-_LLM_OCR_MAX_TOKENS = 8192
+_POLISH_TIMEOUT_SECONDS = 120
+_INDRA_CACHE_DIR = Path(
+    os.environ.get("HF_HOME", str(Path.home() / ".cache" / "huggingface"))
+).resolve()
+_INDRA_THREADS = max(1, int(os.environ.get("INDRA_OCR_THREADS", "4")))
+_OFFICE_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
+_OFFICE_IMAGE_MAX_FILES = 100
+_OFFICE_IMAGE_MAX_BYTES = 20 * 1024 * 1024
+_OFFICE_IMAGE_MAX_TOTAL_BYTES = 100 * 1024 * 1024
 _LLM_MAX_LINE_REPEATS = 10
 _POLISH_CHUNK_MAX_CHARS = 10000
 _POLISH_CHUNK_WORKERS = 3
+_INDRA_CONVERTER: Any = None
+_INDRA_LOCK = threading.Lock()
 
 _conversion_jobs: dict[str, dict[str, Any]] = {}
 _jobs_lock = threading.Lock()
@@ -350,7 +356,7 @@ def _render_landing_page(endpoint_url: str, scheme: str) -> str:
         <dt>Input dir</dt><dd><code>{_escape_html(str(_DOCUMENT_INPUT_DIR))}</code></dd>
         <dt>Output dir</dt><dd><code>{_escape_html(str(_DOCUMENT_OUTPUT_DIR))}</code></dd>
         <dt>Workspaces root</dt><dd><code>{_escape_html(str(_WORKSPACES_ROOT))}</code></dd>
-        <dt>OCR</dt><dd>LLM vision / <code>{_escape_html(_LLM_MODEL)}</code></dd>
+        <dt>OCR</dt><dd>Local Indra OCR / CPU / cache <code>{_escape_html(str(_INDRA_CACHE_DIR))}</code></dd>
       </dl>
     </section>
     <section class="panel">
@@ -530,11 +536,10 @@ def _tool_status() -> list[TextContent]:
             "workspacesRoot": str(_WORKSPACES_ROOT),
             "maxUploadBytes": _MAX_UPLOAD_BYTES,
             "ocr": {
-                "pipeline": "llm-vision-markdown",
-                "baseUrl": _LLM_BASE_URL,
-                "model": _LLM_MODEL,
-                "apiKeyConfigured": bool(_LLM_API_KEY),
-                "pdftoppmAvailable": bool(shutil.which("pdftoppm")),
+                "pipeline": "indra-local-markdown",
+                "engine": "indra-ocr",
+                "cacheDir": str(_INDRA_CACHE_DIR),
+                "threads": _INDRA_THREADS,
                 "correctionScreen": "/correction",
             },
             "office": {"converter": "markitdown"},
@@ -644,16 +649,15 @@ def _convert_file(path: Path, tmpdir: Path) -> tuple[str, str, str | None]:
     if suffix in _TEXT_EXTENSIONS:
         return _convert_text(path), "text", None
     if suffix in _OFFICE_EXTENSIONS:
-        markdown, ocr_status = _convert_office(path)
+        markdown, ocr_status = _convert_office(path, tmpdir)
         return markdown, f"markitdown{suffix}", ocr_status
     if suffix in _IMAGE_EXTENSIONS:
         try:
-            markdown = _ocr_image(path, tmpdir)
+            markdown = _indra_ocr(path)
         except Exception as exc:
             reason = _ocr_skipped_reason(exc)
             return _fallback_visual_markdown(path, reason), "image-fallback", reason
-        method = "image-llm-ocr-mermaid" if "```mermaid" in markdown else "image-llm-ocr"
-        return markdown, method, "done"
+        return markdown, "image-indra-ocr", "done"
     if suffix == ".pdf":
         return _convert_pdf(path, tmpdir)
     raise ValueError(f"Unsupported file type: {suffix}")
@@ -672,27 +676,14 @@ def _convert_text(path: Path) -> str:
     return text if path.suffix.lower() in {".md", ".markdown"} else _plain_text_to_markdown(text)
 
 
-def _convert_markitdown(path: Path, enable_llm_plugins: bool = False) -> str:
+def _convert_markitdown(path: Path) -> str:
     try:
         from markitdown import MarkItDown
     except ImportError as exc:
         raise ValueError("MarkItDown is required for this document type.") from exc
 
-    kwargs: dict[str, Any] = {"enable_plugins": enable_llm_plugins}
-    if enable_llm_plugins and _LLM_API_KEY and _LLM_MODEL:
-        try:
-            from openai import OpenAI
-
-            kwargs["llm_client"] = OpenAI(api_key=_LLM_API_KEY, base_url=_LLM_BASE_URL)
-            kwargs["llm_model"] = _LLM_MODEL
-            kwargs["llm_prompt"] = _llm_ocr_prompt()
-        except ImportError:
-            kwargs["enable_plugins"] = False
-    else:
-        kwargs["enable_plugins"] = False
-
     try:
-        result = MarkItDown(**kwargs).convert(str(path))
+        result = MarkItDown(enable_plugins=False).convert(str(path))
     except Exception as exc:
         raise ValueError(f"MarkItDown conversion failed: {exc}") from exc
 
@@ -707,16 +698,82 @@ def _convert_markitdown(path: Path, enable_llm_plugins: bool = False) -> str:
     return markdown + "\n"
 
 
-def _convert_office(path: Path) -> tuple[str, str | None]:
-    try:
-        return _convert_markitdown(path, enable_llm_plugins=True), None
-    except Exception as exc:
-        if not _LLM_API_KEY:
-            raise
+def _convert_office(path: Path, tmpdir: Path) -> tuple[str, str | None]:
+    markdown = _convert_markitdown(path)
+    images, skipped = _extract_office_images(path, tmpdir)
+    recognized: list[str] = []
+    for index, image in enumerate(images, start=1):
         try:
-            return _convert_markitdown(path, enable_llm_plugins=False), _ocr_skipped_reason(exc)
-        except Exception:
-            raise exc
+            image_markdown = _indra_ocr(image).strip()
+        except Exception as exc:
+            skipped.append(_mask_secret_text(exc))
+            continue
+        recognized.append(
+            f"### Embedded image {index}\n\n{image_markdown}"
+        )
+
+    if recognized:
+        markdown = (
+            markdown.rstrip()
+            + "\n\n## Embedded image OCR\n\n"
+            + "\n\n".join(recognized)
+            + "\n"
+        )
+    if not images and not skipped:
+        return markdown, None
+    if not skipped:
+        return markdown, "done"
+    if recognized:
+        return markdown, f"partial ({len(skipped)} embedded image(s) skipped: {skipped[0]})"
+    return markdown, _ocr_skipped_reason(ValueError(skipped[0]))
+
+
+def _extract_office_images(path: Path, tmpdir: Path) -> tuple[list[Path], list[str]]:
+    """Read bounded raster media from ZIP-based Office files without extracting archive paths."""
+    if path.suffix.lower() not in {".docx", ".pptx", ".xlsx", ".odt", ".ods", ".odp"}:
+        return [], []
+    try:
+        archive = zipfile.ZipFile(path)
+    except (OSError, zipfile.BadZipFile) as exc:
+        return [], [f"could not read embedded images: {type(exc).__name__}"]
+
+    images: list[Path] = []
+    skipped: list[str] = []
+    total_bytes = 0
+    media = [
+        info for info in archive.infolist()
+        if not info.is_dir()
+        and Path(info.filename).suffix.lower() in _OFFICE_IMAGE_EXTENSIONS
+        and (
+            "/media/" in f"/{info.filename.lower()}"
+            or "/pictures/" in f"/{info.filename.lower()}"
+        )
+    ]
+    media.sort(key=lambda info: info.filename.casefold())
+    try:
+        for info in media:
+            if len(images) >= _OFFICE_IMAGE_MAX_FILES:
+                skipped.append(f"more than {_OFFICE_IMAGE_MAX_FILES} embedded images")
+                break
+            if info.file_size > _OFFICE_IMAGE_MAX_BYTES:
+                skipped.append(f"embedded image exceeds {_OFFICE_IMAGE_MAX_BYTES} bytes")
+                continue
+            if total_bytes + info.file_size > _OFFICE_IMAGE_MAX_TOTAL_BYTES:
+                skipped.append(f"embedded images exceed {_OFFICE_IMAGE_MAX_TOTAL_BYTES} bytes total")
+                break
+            data = archive.read(info)
+            if len(data) != info.file_size:
+                skipped.append("embedded image size did not match its archive entry")
+                continue
+            target = tmpdir / f"office-image-{len(images) + 1}{Path(info.filename).suffix.lower()}"
+            target.write_bytes(data)
+            images.append(target)
+            total_bytes += len(data)
+    except (OSError, RuntimeError, zipfile.BadZipFile) as exc:
+        skipped.append(f"could not read embedded image: {type(exc).__name__}")
+    finally:
+        archive.close()
+    return images, skipped
 
 
 def _extract_pdf_text(path: Path) -> str:
@@ -733,53 +790,16 @@ def _extract_pdf_text(path: Path) -> str:
     return "\n\n".join(chunks)
 
 
-def _pdf_pages_requiring_visual_ocr(path: Path) -> list[int]:
-    try:
-        import fitz
-    except ImportError as exc:
-        raise ValueError("PyMuPDF is required for PDF image detection.") from exc
-    pages: list[int] = []
-    with fitz.open(path) as document:
-        for index, page in enumerate(document, start=1):
-            text = page.get_text("text").strip()
-            if not text:
-                pages.append(index)
-                continue
-            page_area = max(page.rect.width * page.rect.height, 1)
-            image_ratios: list[float] = []
-            for image in page.get_images(full=True):
-                xref = image[0]
-                for rect in page.get_image_rects(xref):
-                    area = rect.width * rect.height
-                    if area > 0:
-                        image_ratios.append(area / page_area)
-            largest_image = max(image_ratios or [0])
-            total_image_area = sum(image_ratios)
-            if len(text) < 800 or largest_image >= 0.10 or total_image_area >= 0.18:
-                pages.append(index)
-    return pages
-
-
 def _convert_pdf(path: Path, tmpdir: Path) -> tuple[str, str, str | None]:
-    text = _extract_pdf_text(path)
-    image_pages = _pdf_pages_requiring_visual_ocr(path)
-    if not text.strip():
+    try:
+        return _indra_ocr(path), "pdf-indra-ocr", "done"
+    except Exception as exc:
+        reason = _ocr_skipped_reason(exc)
         try:
-            return _ocr_pdf(path, tmpdir), "pdf-llm-ocr", "done"
-        except Exception as exc:
-            reason = _ocr_skipped_reason(exc)
-            return _fallback_pdf_markdown(path, text, reason), "pdf-fallback", reason
-    chunks = [_convert_markitdown(path).strip()]
-    if image_pages:
-        try:
-            image_markdown = _ocr_pdf(path, tmpdir, pages=image_pages).strip()
-        except Exception as exc:
-            reason = _ocr_skipped_reason(exc)
-            return chunks[0].strip() + "\n", "pdf-markitdown", reason
-        if image_markdown:
-            chunks.append("## Contenu visuel OCR\n\n" + image_markdown)
-        return "\n\n".join(chunks).strip() + "\n", "pdf-markitdown+llm-ocr", "done"
-    return chunks[0] + "\n", "pdf-markitdown", None
+            text = _extract_pdf_text(path)
+        except Exception:
+            text = ""
+        return _fallback_pdf_markdown(path, text, reason), "pdf-fallback", reason
 
 
 def _ocr_skipped_reason(exc: Exception) -> str:
@@ -793,43 +813,6 @@ def _fallback_visual_markdown(path: Path, reason: str) -> str:
 def _fallback_pdf_markdown(path: Path, text: str, reason: str) -> str:
     body = text.strip() if text.strip() else f"OCR: {reason}\n\nSource PDF: `{path.name}`"
     return _plain_text_to_markdown(body)
-
-
-def _ocr_pdf(path: Path, tmpdir: Path, pages: list[int] | None = None) -> str:
-    _require_llm_ocr()
-    if not shutil.which("pdftoppm"):
-        raise ValueError("pdftoppm is required to render PDF pages for LLM OCR.")
-    image_prefix = tmpdir / "page"
-    chunks: list[str] = []
-    if pages:
-        for page_number in pages:
-            page_prefix = tmpdir / f"page-{page_number}"
-            subprocess.run(
-                ["pdftoppm", "-r", "200", "-png", "-f", str(page_number), "-l", str(page_number), str(path), str(page_prefix)],
-                check=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=180,
-            )
-            for image in sorted(tmpdir.glob(f"page-{page_number}-*.png")):
-                markdown = _llm_image_to_markdown(image)
-                if markdown.strip():
-                    chunks.append(markdown.strip())
-    else:
-        subprocess.run(
-            ["pdftoppm", "-r", "200", "-png", str(path), str(image_prefix)],
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=180,
-        )
-        for image in sorted(tmpdir.glob("page-*.png")):
-            markdown = _llm_image_to_markdown(image)
-            if markdown.strip():
-                chunks.append(markdown.strip())
-    return "\n\n".join(chunks).strip() + "\n"
 
 
 _POLISH_EXEMPT_METHODS = {"text", "image-fallback", "pdf-fallback"}
@@ -1088,9 +1071,9 @@ def _split_block_into_chunks(block: str) -> list[str]:
 
 
 def _llm_polish_call(markdown: str, language: str | None = None, base_url: str | None = None, model: str | None = None, api_key: str | None = None) -> str:
-    base_url = (base_url or _LLM_BASE_URL).rstrip("/")
-    model = model or _LLM_MODEL
-    api_key = api_key or _LLM_API_KEY
+    if not base_url or not model or not api_key:
+        raise ValueError("The target workspace must provide a complete LLM profile for Markdown polishing.")
+    base_url = base_url.rstrip("/")
     payload: dict[str, Any] = {
         "model": model,
         "messages": [
@@ -1113,7 +1096,7 @@ def _llm_polish_call(markdown: str, language: str | None = None, base_url: str |
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=_LLM_TIMEOUT_SECONDS) as response:
+        with urllib.request.urlopen(request, timeout=_POLISH_TIMEOUT_SECONDS) as response:
             result = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
@@ -1213,92 +1196,51 @@ def _wikirc_llm_block(workspace_path: Path | None) -> dict[str, str] | None:
 
 def _polish_llm_config(workspace_path: Path | None) -> tuple[str, str, str] | None:
     block = _wikirc_llm_block(workspace_path)
-    if block:
-        base_url = block["baseUrl"]
-        api_key = block.get("apiKey") or _LLM_API_KEY
-        if api_key:
-            return base_url, block["model"], api_key
-    if _LLM_API_KEY and _LLM_MODEL:
-        return _LLM_BASE_URL, _LLM_MODEL, _LLM_API_KEY
-    return None
+    if not block or not block.get("apiKey"):
+        return None
+    return block["baseUrl"], block["model"], block["apiKey"]
 
 
-def _ocr_image(path: Path, tmpdir: Path | None = None) -> str:
-    _require_llm_ocr()
-    return _llm_image_to_markdown(path).strip() + "\n"
+def _indra_ocr(path: Path) -> str:
+    """Convert an image or PDF locally with Indra OCR, preserving page order."""
+    global _INDRA_CONVERTER
+    with _INDRA_LOCK:
+        if _INDRA_CONVERTER is None:
+            try:
+                os.environ.setdefault("HF_HOME", str(_INDRA_CACHE_DIR))
+                import indra_ocr
+            except ImportError as exc:
+                raise ValueError("Indra OCR is required for PDF and image conversion.") from exc
+            _INDRA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            try:
+                _INDRA_CONVERTER = indra_ocr.load(
+                    threads=_INDRA_THREADS,
+                    mode="auto",
+                    image_ocr=True,
+                )
+            except Exception as exc:
+                raise ValueError(f"Could not initialize Indra OCR: {exc}") from exc
 
+        chunks: list[str] = []
+        try:
+            for page_number, page in _INDRA_CONVERTER.convert(str(path)):
+                if getattr(page, "source", None) == "error":
+                    note = str(getattr(page, "note", "") or "page conversion failed")
+                    raise ValueError(f"page {page_number}: {note}")
+                markdown = str(
+                    getattr(page, "markdown", None)
+                    or getattr(page, "text", None)
+                    or ""
+                ).strip()
+                if markdown:
+                    chunks.append(markdown)
+        except Exception as exc:
+            raise ValueError(f"Indra OCR failed: {exc}") from exc
 
-def _require_llm_ocr() -> None:
-    if not _LLM_API_KEY:
-        raise ValueError("LLM OCR requires DOCUMENT_LLM_API_KEY or OPENAI_API_KEY.")
-    if not _LLM_MODEL:
-        raise ValueError("LLM OCR requires DOCUMENT_LLM_MODEL.")
-
-
-def _llm_image_to_markdown(path: Path) -> str:
-    _require_llm_ocr()
-    mime, _ = mimetypes.guess_type(path.name)
-    if not mime or not mime.startswith("image/"):
-        mime = "image/png"
-    image_b64 = base64.b64encode(path.read_bytes()).decode("ascii")
-    payload: dict[str, Any] = {
-        "model": _LLM_MODEL,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": _llm_ocr_prompt()},
-                    {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{image_b64}", "detail": "high"}},
-                ],
-            }
-        ],
-        "max_tokens": _LLM_OCR_MAX_TOKENS,
-    }
-    if not _model_refuses_temperature(_LLM_MODEL):
-        payload["temperature"] = 0
-    data = json.dumps(payload).encode("utf-8")
-    request = urllib.request.Request(
-        f"{_LLM_BASE_URL}/chat/completions",
-        data=data,
-        headers={
-            "Authorization": f"Bearer {_LLM_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=_LLM_TIMEOUT_SECONDS) as response:
-            result = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        raise ValueError(f"LLM OCR failed: HTTP {exc.code}: {body}") from exc
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
-        raise ValueError(f"LLM OCR failed: {exc}") from exc
-
-    content = (
-        result.get("choices", [{}])[0]
-        .get("message", {})
-        .get("content", "")
-    )
-    markdown = _clean_llm_markdown(str(content))
-    if not markdown:
-        raise ValueError("LLM OCR returned empty Markdown.")
-    if _looks_degenerate(markdown):
-        raise ValueError("LLM OCR returned repetitive/degenerate content.")
-    return markdown
-
-
-def _llm_ocr_prompt() -> str:
-    return (
-        "Convert this image faithfully to Markdown. "
-        "Return only Markdown, with no commentary outside the converted content. "
-        "Never emit HTML tags: output pure Markdown only. "
-        "Preserve the visible labels, titles, lists, tables, relationships, and their original language. "
-        "If the image contains a diagram, add a '## Mermaid Diagram' section with a ```mermaid block. "
-        "The Mermaid diagram must reconstruct visible groups/subgraphs, actors, systems, databases, arrows, labels, and protocols. "
-        "Use simple ASCII Mermaid IDs, quoted labels, no escaped quotes, and <br/> line breaks inside labels. "
-        "Do not invent missing elements. If an area is unreadable, keep the best readable label."
-    )
+        result = "\n\n".join(chunks).strip()
+        if not result:
+            raise ValueError("Indra OCR returned empty Markdown.")
+        return result + "\n"
 
 
 def _looks_degenerate(markdown: str) -> bool:
