@@ -9,7 +9,6 @@ services:
       - DOCUMENT_OUTPUT_DIR=/documents/output
       - WORKSPACES_ROOT=/workspaces
       - DOCUMENT_MAX_UPLOAD_BYTES=${DOCUMENT_MAX_UPLOAD_BYTES:-52428800}
-      - HF_HOME=/var/cache/huggingface
       - INDRA_OCR_THREADS=${INDRA_OCR_THREADS:-4}
       # HTTPS — uncomment and provide files in ./certs/
       #- MCP_SSL_CERTFILE=/certs/server.crt
@@ -17,11 +16,7 @@ services:
     volumes:
       - ${DOCUMENT_INPUT_HOST_DIR:-./documents/input}:/documents/input
       - ${DOCUMENT_OUTPUT_HOST_DIR:-./documents/output}:/documents/output
-      - indra-model-cache:/var/cache/huggingface
       - ${WORKSPACES_ROOT:?Set WORKSPACES_ROOT to the directory containing all workspaces}:/workspaces
       # TLS certificates — uncomment if MCP_SSL_CERTFILE is set
       #- ./certs:/certs:ro
     restart: unless-stopped
-
-volumes:
-  indra-model-cache:

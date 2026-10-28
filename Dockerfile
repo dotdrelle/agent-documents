@@ -14,6 +14,12 @@ RUN pip install --no-cache-dir --upgrade pip && \
     PyMuPDF \
     starlette \
     uvicorn
+# Bake the exact Indra model revision into the image. Runtime containers stay
+# offline, including when their host is behind a VPN that blocks Hugging Face.
+# Keep the model's license beside the weights for image redistribution.
+COPY --chmod=644 prefetch_indra_model.py .
+RUN HF_HOME=/tmp/indra-prefetch-cache python prefetch_indra_model.py && \
+    rm -rf /tmp/indra-prefetch-cache
 # The server runs straight from site-packages; pip is build-time only. Remove
 # it, and ensurepip's bundled wheel, so pip's vendored msgpack 1.1.2 and
 # setuptools 70.3.0 are neither shipped nor picked up by image scanners as
@@ -28,7 +34,9 @@ ENV MCP_PORT=8080
 ENV DOCUMENT_INPUT_DIR=/documents/input
 ENV DOCUMENT_OUTPUT_DIR=/documents/output
 ENV DOCUMENT_MAX_UPLOAD_BYTES=52428800
-ENV HF_HOME=/var/cache/huggingface
+ENV HF_HOME=/tmp/indra-huggingface
+ENV HF_HUB_OFFLINE=1
+ENV INDRA_OCR_MODEL_DIR=/opt/indra-model
 ENV INDRA_OCR_THREADS=4
 
 # Unprivileged runtime user. Its home does not exist on purpose: an arbitrary
@@ -36,8 +44,7 @@ ENV INDRA_OCR_THREADS=4
 RUN groupadd --system --gid 1000 app && \
     useradd --system --uid 1000 --gid app --no-create-home \
       --home-dir /nonexistent --shell /usr/sbin/nologin app && \
-    install -d -o app -g app /documents/input /documents/output && \
-    install -d -m 1777 /var/cache/huggingface
+    install -d -o app -g app /documents/input /documents/output
 
 EXPOSE 8080
 

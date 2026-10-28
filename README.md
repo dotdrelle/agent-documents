@@ -82,14 +82,16 @@ export DOCUMENT_MAX_UPLOAD_BYTES=52428800
 export INDRA_OCR_THREADS=4
 ```
 
-OCR runs locally and does not require an LLM key. Indra downloads its model
-files from Hugging Face on first use. Compose stores them in a persistent named
-volume at `HF_HOME`.
+OCR runs locally and does not require an LLM key. The Docker image includes the
+Indra v1.1.0 model files and runs with Hugging Face offline mode enabled, so the
+container does not download model files at startup. Building a new image fetches
+the pinned model revision from Hugging Face. The model weights are distributed
+under their modified OpenRAIL-M license, included in the image at
+`/usr/share/licenses/indra-ocr/LICENSE`; review the [model license](https://huggingface.co/datalab-to/indra-ocr/blob/v1.1.0/LICENSE)
+before redistributing the image.
 
-The optional final LLM formatting pass uses only the target workspace's `llm`
-block (`baseUrl`, `model`, `apiKey`) from `.wikirc.yaml`. If no workspace or no
-complete `llm` profile is available, the polish pass is skipped. There is no
-separate LLM configuration for the documents agent.
+The Documents agent does not call an LLM. Converted Markdown is written
+directly from Indra or MarkItDown output, with conversion and OCR metadata.
 
 `docker-compose.yml` mounts `${WORKSPACES_ROOT}` at `/workspaces`. When
 `documents_convert_to_markdown` receives `workspace`, converted Markdown is ready
@@ -138,21 +140,10 @@ Optional arguments:
 
 For image files and PDFs, OCR runs through the local Indra model. The document
 is not sent to a vision provider for OCR. Indra extracts text and layout; it does
-not turn diagrams into Mermaid. Optional Markdown polishing uses the target
-workspace's `.wikirc.yaml` LLM profile.
-
-Every machine-produced Markdown (OCR and MarkItDown output) then goes through
-two finishing steps before being written. A deterministic, LLM-free cleanup
-first converts leftover HTML into Markdown, drops unavailable image
-references, rejoins links split across lines and normalizes blank lines —
-this runs regardless of size or connectivity. Then an LLM cleanup pass
-repairs broken Markdown syntax and links, removes OCR/encoding artifacts,
-and keeps the language declared in the target workspace's `.wikirc.yaml`
-(`language` key). Documents too large for one call are polished in parallel
-chunks — there is no size cap. A failure of either pass never fails the
-conversion: the result falls back to the previous stage and the skip reason
-is recorded in the `polish` front matter key. Plain text files and degraded
-fallback stubs skip both passes.
+not turn diagrams into Mermaid. The agent writes converted Markdown directly
+from Indra or MarkItDown output and does not read the workspace's `.wikirc.yaml`
+or call an LLM. Front matter records the conversion method and OCR status where
+applicable.
 
 The local correction screen is available at:
 
